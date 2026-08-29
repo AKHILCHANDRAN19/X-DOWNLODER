@@ -10,12 +10,16 @@ import zipfile
 import tarfile
 import subprocess
 import collections
-import urllib.request
 from datetime import datetime
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
+
+# ==========================================
+# 0. CONFIGURATION & CHANNEL SETUP
+# ==========================================
+TARGET_CHANNEL_ID = -1004495069376
 
 # ==========================================
 # 1. TELEMETRY & PERSISTENT LOG STATE
@@ -73,7 +77,7 @@ def format_time(seconds):
 
 def build_progress_card(action_name: str, current: int, total: int, speed: float, eta: float) -> str:
     if total and total > 0:
-        pct = (current / total) * 100
+        pct = min(100.0, (current / total) * 100)
         filled_blocks = max(0, min(10, int(pct / 10)))
         bar = "▪" * filled_blocks + "▫" * (10 - filled_blocks)
         tot_str = format_size(total)
@@ -129,16 +133,18 @@ async def monitor_aria2_download(video_id: str, total_bytes: int, status_msg, st
         now = time.time()
 
         matched_files = glob.glob(f"{video_id}*")
-        current_bytes = sum(os.path.getsize(f) for f in matched_files if os.path.isfile(f) and not f.endswith(('.jpg', '.png', '.webp')))
+        current_bytes = sum(os.path.getsize(f) for f in matched_files if os.path.isfile(f) and not f.endswith(('.jpg', '.png', '.webp', '.aria2')))
 
         if now - last_update > 3.0 and current_bytes > 0:
             elapsed = now - start_time
             speed = (current_bytes - last_bytes) / (now - last_update) if last_update > 0 else (current_bytes / elapsed)
             last_bytes = current_bytes
 
-            eta = (total_bytes - current_bytes) / speed if (speed > 0 and total_bytes > current_bytes) else None
+            # Dynamically adapt total if stream size exceeds initial metadata estimate
+            effective_total = max(total_bytes, current_bytes) if total_bytes > 0 else 0
+            eta = (effective_total - current_bytes) / speed if (speed > 0 and effective_total > current_bytes) else 0
 
-            text = build_progress_card("Downloading", current_bytes, total_bytes, speed, eta)
+            text = build_progress_card("Downloading", current_bytes, effective_total, speed, eta)
             last_update = now
             try:
                 await status_msg.edit_text(text)
@@ -165,7 +171,7 @@ async def upload_progress_callback(current, total, status_msg, tracker):
             pass
 
 # ==========================================
-# 3. VIDEO METADATA & STREAM HELPERS
+# 3. METADATA, THUMBNAILS & BROADCASTING
 # ==========================================
 def extract_video_thumbnail(video_path: str) -> str:
     thumb_path = f"{video_path}.thumb.jpg"
@@ -220,7 +226,7 @@ def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 
     if current_size <= max_bytes:
         return video_path
 
-    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Applying disk compression...")
+    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Compressing...")
     duration, _, _ = get_video_specs(video_path)
     compressed_path = f"{video_path}.compressed.mp4"
 
@@ -251,37 +257,65 @@ def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 
 
     return video_path
 
-def get_exact_total_size(info: dict, is_youtube: bool, selected_quality: str) -> int:
-    target_h = int(selected_quality) if selected_quality.isdigit() else 720
+def get_accurate_720p_size(info: dict, selected_quality: str) -> int:
+    target_h = int(selected_quality) if str(selected_quality).isdigit() else 720
     formats = info.get('formats', [])
 
-    # Check direct format matches
-    for f in formats:
-        h = f.get('height') or 0
-        if h <= target_h:
-            size = f.get('filesize') or f.get('filesize_approx')
-            if size and size > 0:
-                return size
+    # Filter matching formats at or below the selected quality
+    matching_formats = [
+        f for f in formats
+        if (f.get('height') or 0) <= target_h and f.get('vcodec') != 'none'
+    ]
 
-            # Probe HTTP header for X/Twitter direct MP4s
-            url = f.get('url', '')
-            if not is_youtube and url.startswith('http') and '.m3u8' not in url:
-                try:
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}, method='HEAD')
-                    with urllib.request.urlopen(req, timeout=3) as resp:
-                        cl = resp.headers.get('Content-Length')
-                        if cl and cl.isdigit():
-                            return int(cl)
-                except Exception:
-                    pass
+    # Sort descending by resolution, then by size/bitrate
+    matching_formats.sort(
+        key=lambda x: (
+            x.get('height') or 0,
+            x.get('filesize') or x.get('filesize_approx') or ((x.get('tbr') or 0) * (info.get('duration') or 0))
+        ),
+        reverse=True
+    )
 
-    # Fallback to duration * bitrate estimation
-    duration = info.get('duration', 0)
-    tbr = info.get('tbr', 0)
-    if duration and tbr:
-        return int((tbr * 1024 / 8) * duration)
+    if matching_formats:
+        best_match = matching_formats[0]
+        size = best_match.get('filesize') or best_match.get('filesize_approx')
+        if size and size > 0:
+            return size
+        if best_match.get('tbr') and info.get('duration'):
+            return int((best_match['tbr'] * 1024 / 8) * info['duration'])
 
-    return 0
+    # Fallback to general estimation
+    total = info.get('filesize') or info.get('filesize_approx') or 0
+    if not total and info.get('tbr') and info.get('duration'):
+        total = int((info['tbr'] * 1024 / 8) * info['duration'])
+    return total
+
+async def broadcast_to_channel(client, text=None, video_path=None, photo_path=None, doc_path=None, caption="", thumb=None, duration=0, width=1280, height=720):
+    if not TARGET_CHANNEL_ID:
+        return
+    try:
+        if text:
+            chunks = [text[i:i+3500] for i in range(0, len(text), 3500)]
+            for chunk in chunks:
+                await client.send_message(TARGET_CHANNEL_ID, chunk)
+                await asyncio.sleep(0.5)
+        elif video_path and os.path.exists(video_path):
+            await client.send_video(
+                TARGET_CHANNEL_ID,
+                video=video_path,
+                caption=caption,
+                thumb=thumb,
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True
+            )
+        elif photo_path and os.path.exists(photo_path):
+            await client.send_photo(TARGET_CHANNEL_ID, photo=photo_path, caption=caption)
+        elif doc_path and os.path.exists(doc_path):
+            await client.send_document(TARGET_CHANNEL_ID, document=doc_path, caption=caption)
+    except Exception as e:
+        GLOBAL_STATE.log(f"Channel Broadcast Notice: {e}")
 
 # ==========================================
 # 4. PYROFORK BOT RUNNER
@@ -302,14 +336,15 @@ async def run_pyrofork_bot():
             welcome_text = (
                 "👋 **Welcome to the Media Downloader & Unpack Bot!** ⚡\n\n"
                 "**🌟 Features:**\n"
-                "• 🚀 **High-Speed Direct Engine:**\n"
+                "• 🚀 **Engine Routing:**\n"
                 "   - **X (Twitter):** `aria2c` 16-connection parallel acceleration\n"
                 "   - **YouTube:** Multi-fragment stream extraction (Public & Unlisted)\n"
-                "• 🎛️ **Resolution Control:** Max 720p with auto 480p/360p fallback under 1.95 GB\n"
-                "• 📊 **Accurate Live Telemetry Cards:** Percentage, Speed & ETA\n"
-                "• 🖼️ **Native Video Thumbnails:** Screenshot capture & video metadata\n"
+                "• 🎛️ **Resolution & Quality:** True 720p with automatic fallback under 1.95 GB\n"
+                "• 📊 **Live Telemetry Cards:** Real-time speed, percentage, ETA, and progress bar\n"
+                "• 🖼️ **Auto Thumbnail Generation:** High-resolution frame capture & video specs\n"
+                "• 📢 **Channel Broadcast:** Synchronized media and post archiving\n"
                 "• 🗜️ **Archive Unpacker (`/unzip`):** Uncompresses `.zip`, `.tar`, `.gz`, etc.\n\n"
-                "**Usage:**\n"
+                "**How to use:**\n"
                 "• Send one or more X/YouTube links separated by commas.\n"
                 "• Reply with `/unzip` to any uploaded archive to unpack it."
             )
@@ -383,17 +418,22 @@ async def run_pyrofork_bot():
 
                 for idx, file_path in enumerate(all_extracted):
                     file_name = os.path.basename(file_path)
+                    doc_caption = f"📄 `{file_name}` ({format_size(os.path.getsize(file_path))})"
                     up_tracker = {'start_time': time.time(), 'last_update': 0.0}
 
                     await status_msg.edit_text(f"⬆️ Uploading ({idx + 1}/{len(all_extracted)}): `{file_name}`")
 
+                    # 1. Send to user inbox
                     await client.send_document(
                         chat_id=message.chat.id,
                         document=file_path,
-                        caption=f"📄 `{file_name}` ({format_size(os.path.getsize(file_path))})",
+                        caption=doc_caption,
                         progress=upload_progress_callback,
                         progress_args=(status_msg, up_tracker)
                     )
+
+                    # 2. Broadcast to channel
+                    await broadcast_to_channel(client, doc_path=file_path, caption=doc_caption)
 
                     if os.path.exists(file_path):
                         os.remove(file_path)
@@ -412,7 +452,7 @@ async def run_pyrofork_bot():
                 gc.collect()
 
         # ----------------------------------------------------
-        # MEDIA URL DOWNLOADER
+        # MEDIA URL DOWNLOADER (X + YOUTUBE)
         # ----------------------------------------------------
         @app.on_message(filters.text & filters.private & ~filters.command(["start", "unzip"]))
         async def handle_media_urls(client, message):
@@ -463,26 +503,29 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)} ({engine_name})")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)} via {engine_name}...")
 
-                    # 1. Fetch metadata first
+                    # 1. Fetch metadata
                     with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
                     post_text = info.get('description') or info.get('title') or ""
 
-                    # 2. SEND POST TEXT FIRST AS A SEPARATE MESSAGE
+                    # 2. SEND POST TEXT FIRST (To User and Channel)
                     if post_text and post_text.strip():
-                        await message.reply_text(f"📝 **Post Content:**\n\n{post_text.strip()}")
+                        post_formatted = f"📝 **Post Content:**\n\n{post_text.strip()}"
+                        await message.reply_text(post_formatted)
+                        await broadcast_to_channel(client, text=post_formatted)
+                        await asyncio.sleep(0.4)
 
-                    # 3. Calculate exact total size
-                    total_bytes = get_exact_total_size(info, is_youtube, selected_quality)
+                    # 3. Calculate accurate size for progress telemetry
+                    total_bytes = get_accurate_720p_size(info, selected_quality)
 
-                    # 4. Configure optimized format strings
+                    # 4. Format selection locked strictly to true 720p quality
                     if is_youtube:
                         fmt = (
                             f"bestvideo[height<={selected_quality}][ext=mp4]+bestaudio[ext=m4a]/"
                             f"bestvideo[height<={selected_quality}]+bestaudio/"
                             f"best[height<={selected_quality}]/"
-                            f"best[height<=480]/best"
+                            f"best[height<=480]/best[height<=720]"
                         )
                         dl_tracker = {'last_update': 0.0}
                         ydl_opts = {
@@ -497,12 +540,12 @@ async def run_pyrofork_bot():
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             await asyncio.to_thread(ydl.download, [url])
                     else:
-                        # Prioritize direct progressive MP4 to enable maximum 16-connection aria2c speed
+                        # Ensures full quality 720p stream with aria2 multi-threading
                         fmt = (
-                            f"best[height<={selected_quality}][protocol^=http]/"
+                            f"bestvideo[height<={selected_quality}]+bestaudio/"
+                            f"best[height<={selected_quality}][ext=mp4]/"
                             f"best[height<={selected_quality}]/"
-                            f"best[height<=480][protocol^=http]/"
-                            f"best[height<=480]/"
+                            f"bestvideo[height<=480]+bestaudio/best[height<=480]/"
                             f"best[height<=720]"
                         )
                         ydl_opts = {
@@ -541,7 +584,7 @@ async def run_pyrofork_bot():
 
                     # 5. Identify downloaded files
                     downloaded = glob.glob(f"{video_id}.*")
-                    media_files = [f for f in downloaded if not f.endswith(('.jpg', '.jpeg', '.webp', '.png', '.thumb.jpg'))]
+                    media_files = [f for f in downloaded if not f.endswith(('.jpg', '.jpeg', '.webp', '.png', '.thumb.jpg', '.aria2'))]
                     image_files = [f for f in downloaded if f.endswith(('.jpg', '.jpeg', '.webp', '.png')) and not f.endswith('.thumb.jpg')]
 
                     # 6. Upload Video
@@ -557,6 +600,7 @@ async def run_pyrofork_bot():
                         up_tracker = {'start_time': time.time(), 'last_update': 0.0}
                         await status_msg.edit_text(f"⬆️ Uploading Video ({selected_quality}p)...")
 
+                        # Send to User
                         await client.send_video(
                             chat_id=message.chat.id,
                             video=video_file,
@@ -568,6 +612,17 @@ async def run_pyrofork_bot():
                             supports_streaming=True,
                             progress=upload_progress_callback,
                             progress_args=(status_msg, up_tracker)
+                        )
+
+                        # Broadcast to Channel
+                        await broadcast_to_channel(
+                            client,
+                            video_path=video_file,
+                            caption=caption,
+                            thumb=thumb_file,
+                            duration=duration,
+                            width=width,
+                            height=height
                         )
 
                         if os.path.exists(video_file): os.remove(video_file)
@@ -584,6 +639,7 @@ async def run_pyrofork_bot():
                             photo=img_file,
                             caption=img_caption
                         )
+                        await broadcast_to_channel(client, photo_path=img_file, caption=img_caption)
 
                     for f in glob.glob(f"{video_id}.*"):
                         if os.path.exists(f):
