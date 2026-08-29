@@ -88,7 +88,7 @@ def build_progress_card(action_name: str, current: int, total: int, speed: float
         f"ETA: {eta_str}"
     )
 
-# Native yt-dlp hook for YouTube downloads
+# Native yt-dlp progress hook (YouTube)
 def make_ydl_progress_hook(status_msg, loop, tracker):
     def hook(d):
         if d.get('status') == 'downloading':
@@ -121,7 +121,7 @@ async def monitor_aria2_download(video_id: str, total_bytes: int, status_msg, st
         now = time.time()
         
         matched_files = glob.glob(f"{video_id}*")
-        current_bytes = sum(os.path.getsize(f) for f in matched_files if os.path.isfile(f))
+        current_bytes = sum(os.path.getsize(f) for f in matched_files if os.path.isfile(f) and not f.endswith('.jpg'))
 
         if now - last_update > 3.5 and current_bytes > 0:
             elapsed = now - start_time
@@ -158,7 +158,7 @@ async def upload_progress_callback(current, total, status_msg, tracker):
             pass
 
 # ==========================================
-# 3. VIDEO THUMBNAIL & METADATA EXTRACTOR
+# 3. VIDEO METADATA & COMPRESSION HELPERS
 # ==========================================
 def extract_video_thumbnail(video_path: str) -> str:
     thumb_path = f"{video_path}.thumb.jpg"
@@ -171,7 +171,6 @@ def extract_video_thumbnail(video_path: str) -> str:
         if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             return thumb_path
             
-        # Fallback to frame 0
         cmd[2] = "00:00:00"
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
@@ -206,6 +205,88 @@ def get_video_specs(video_path: str):
         pass
     return duration, width, height
 
+def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 1024) -> str:
+    """If a video exceeds 1.95 GB, compress it using FFmpeg without exceeding memory limits."""
+    if not os.path.exists(video_path):
+        return video_path
+        
+    current_size = os.path.getsize(video_path)
+    if current_size <= max_bytes:
+        return video_path
+
+    GLOBAL_STATE.log(f"Video size ({format_size(current_size)}) exceeds 1.95 GB limit. Starting disk compression...")
+    duration, _, _ = get_video_specs(video_path)
+    compressed_path = f"{video_path}.compressed.mp4"
+
+    target_size_bits = 1800 * 1024 * 1024 * 8
+    if duration > 0:
+        target_bitrate_kbps = max(250, int((target_size_bits / duration) / 1000) - 96)
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{target_bitrate_kbps}k",
+            "-maxrate", f"{int(target_bitrate_kbps * 1.2)}k", "-bufsize", f"{int(target_bitrate_kbps * 2)}k",
+            "-vf", "scale=-2:480", "-c:a", "aac", "-b:a", "96k",
+            compressed_path
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+            "-vf", "scale=-2:480", "-c:a", "aac", "-b:a", "96k",
+            compressed_path
+        ]
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) > 0:
+        os.remove(video_path)
+        os.rename(compressed_path, video_path)
+        GLOBAL_STATE.log(f"Compression completed: {format_size(os.path.getsize(video_path))}")
+        
+    return video_path
+
+def get_smart_format_string(info: dict, requested_quality: str) -> str:
+    """Calculates size before download and enforces strict < 1.95 GB resolution fallback."""
+    target_h = int(requested_quality) if requested_quality.isdigit() else 720
+    target_h = min(720, target_h)
+    
+    duration = info.get('duration', 0)
+    formats = info.get('formats', [])
+    max_bytes = 1950 * 1024 * 1024
+
+    # Calculate best resolution that stays under 1.95 GB
+    resolutions = [720, 480, 360, 240]
+    resolutions = [r for r in resolutions if r <= target_h]
+
+    chosen_res = resolutions[-1]
+    for res in resolutions:
+        matching_fmts = [f for f in formats if f.get('height') == res]
+        is_safe = True
+        
+        for f in matching_fmts:
+            f_size = f.get('filesize') or f.get('filesize_approx')
+            if not f_size and f.get('tbr') and duration:
+                f_size = (f['tbr'] * 1024 / 8) * duration
+            
+            if f_size and f_size > max_bytes:
+                is_safe = False
+                break
+                
+        if is_safe:
+            chosen_res = res
+            break
+
+    # Build strict format query with NO naked /best
+    return (
+        f"bestvideo[height<={chosen_res}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={chosen_res}]+bestaudio/"
+        f"best[height<={chosen_res}][ext=mp4]/"
+        f"best[height<={chosen_res}]/"
+        f"bestvideo[height<=480]+bestaudio/best[height<=480]/"
+        f"bestvideo[height<=360]+bestaudio/best[height<=360]/"
+        f"best[height<=720]"
+    )
+
 # ==========================================
 # 4. PYROFORK BOT RUNNER
 # ==========================================
@@ -228,7 +309,7 @@ async def run_pyrofork_bot():
                 "• 🚀 **Smart Engine Routing:**\n"
                 "   - **X (Twitter):** `aria2c` 16-connection parallel acceleration\n"
                 "   - **YouTube:** Multi-fragment stream extraction (Public & Unlisted)\n"
-                "• 🎛️ **Resolution Control:** Max 720p with automatic 480p/360p fallback under 1.95 GB\n"
+                "• 🎛️ **Resolution & Size Control:** Max 720p with automatic 480p/360p fallback under 1.95 GB\n"
                 "• 📊 **Live Progress Cards:** Real-time speed, percentage, ETA, and progress bar\n"
                 "• 🖼️ **Auto Thumbnail Generation:** High-resolution frame capture & video metadata\n"
                 "• 🗜️ **Archive Unpacker (`/unzip`):** Uncompresses `.zip`, `.tar`, `.gz`, etc.\n\n"
@@ -375,72 +456,63 @@ async def run_pyrofork_bot():
             except Exception:
                 pass
 
-            if selected_quality == "720":
-                fmt = "bestvideo[height<=720][filesize<1950M]+bestaudio/best[height<=720][filesize<1950M]/bestvideo[height<=480][filesize<1950M]+bestaudio/best[height<=480][filesize<1950M]/best"
-            elif selected_quality == "480":
-                fmt = "bestvideo[height<=480][filesize<1950M]+bestaudio/best[height<=480][filesize<1950M]/bestvideo[height<=360][filesize<1950M]+bestaudio/best[height<=360][filesize<1950M]/best"
-            else:
-                fmt = "bestvideo[height<=360][filesize<1950M]+bestaudio/best[height<=360][filesize<1950M]/best"
-
             running_loop = asyncio.get_running_loop()
 
             for idx, url in enumerate(urls):
                 video_id = f"media_{int(time.time())}_{idx}"
                 is_youtube = ("youtube.com" in url or "youtu.be" in url)
 
-                # Route engines: native yt-dlp multi-fragment for YouTube, aria2c for X
-                if is_youtube:
-                    dl_tracker = {'last_update': 0.0}
-                    ydl_opts = {
-                        'format': fmt,
-                        'outtmpl': f'{video_id}.%(ext)s',
-                        'writethumbnail': True,
-                        'concurrent_fragment_downloads': 8,
-                        'progress_hooks': [make_ydl_progress_hook(status_msg, running_loop, dl_tracker)],
-                        'quiet': True,
-                        'no_warnings': True
-                    }
-                else:
-                    ydl_opts = {
-                        'format': fmt,
-                        'outtmpl': f'{video_id}.%(ext)s',
-                        'writethumbnail': True,
-                        'external_downloader': 'aria2c',
-                        'external_downloader_args': {
-                            'aria2c': [
-                                '--continue=true',
-                                '--summary-interval=1',
-                                '--console-log-level=error',
-                                '--max-connection-per-server=16',
-                                '--split=16',
-                                '--min-split-size=1M',
-                                '--max-tries=10',
-                                '--retry-wait=5',
-                                '--timeout=60',
-                                '--check-certificate=false',
-                                '--async-dns=false',
-                            ]
-                        },
-                        'quiet': True,
-                        'no_warnings': True
-                    }
-
                 try:
-                    engine_name = "YouTube Engine" if is_youtube else "aria2c Engine"
+                    engine_name = "YouTube Multi-Fragment Engine" if is_youtube else "aria2c Engine"
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)} ({engine_name})")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)} via {engine_name}...")
 
-                    info = {}
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # 1. Extract metadata to compute safe format string
+                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                    
+
+                    fmt = get_smart_format_string(info, selected_quality)
                     post_text = info.get('description') or info.get('title') or ""
                     total_bytes = info.get('filesize') or info.get('filesize_approx') or 0
 
+                    # 2. Build engine-specific downloader options
                     if is_youtube:
+                        dl_tracker = {'last_update': 0.0}
+                        ydl_opts = {
+                            'format': fmt,
+                            'outtmpl': f'{video_id}.%(ext)s',
+                            'writethumbnail': True,
+                            'concurrent_fragment_downloads': 8,
+                            'progress_hooks': [make_ydl_progress_hook(status_msg, running_loop, dl_tracker)],
+                            'quiet': True,
+                            'no_warnings': True
+                        }
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             await asyncio.to_thread(ydl.download, [url])
                     else:
+                        ydl_opts = {
+                            'format': fmt,
+                            'outtmpl': f'{video_id}.%(ext)s',
+                            'writethumbnail': True,
+                            'external_downloader': 'aria2c',
+                            'external_downloader_args': {
+                                'aria2c': [
+                                    '--continue=true',
+                                    '--summary-interval=1',
+                                    '--console-log-level=error',
+                                    '--max-connection-per-server=16',
+                                    '--split=16',
+                                    '--min-split-size=1M',
+                                    '--max-tries=10',
+                                    '--retry-wait=5',
+                                    '--timeout=60',
+                                    '--check-certificate=false',
+                                    '--async-dns=false',
+                                ]
+                            },
+                            'quiet': True,
+                            'no_warnings': True
+                        }
                         stop_monitor = asyncio.Event()
                         monitor_task = asyncio.create_task(
                             monitor_aria2_download(video_id, total_bytes, status_msg, stop_monitor)
@@ -452,6 +524,7 @@ async def run_pyrofork_bot():
                             stop_monitor.set()
                             await monitor_task
 
+                    # 3. Locate downloaded files
                     downloaded = glob.glob(f"{video_id}.*")
                     media_files = [f for f in downloaded if not f.endswith(('.jpg', '.jpeg', '.webp', '.png', '.thumb.jpg'))]
                     image_files = [f for f in downloaded if f.endswith(('.jpg', '.jpeg', '.webp', '.png')) and not f.endswith('.thumb.jpg')]
@@ -462,8 +535,12 @@ async def run_pyrofork_bot():
                     if len(caption) > 1024:
                         caption = caption[:1020] + "..."
 
+                    # 4. Handle Video Upload
                     if media_files:
                         video_file = media_files[0]
+                        # Final safety check to guarantee upload under 1.95 GB
+                        video_file = await asyncio.to_thread(ensure_under_telegram_limit, video_file)
+
                         thumb_file = extract_video_thumbnail(video_file)
                         duration, width, height = get_video_specs(video_file)
                         
@@ -486,6 +563,7 @@ async def run_pyrofork_bot():
                         if os.path.exists(video_file): os.remove(video_file)
                         if thumb_file and os.path.exists(thumb_file): os.remove(thumb_file)
 
+                    # 5. Handle Photo Upload
                     elif image_files:
                         img_file = image_files[0]
                         img_caption = f"📸 **Image Post**\n{bold_caption_text}🔗 {url}"
@@ -519,7 +597,7 @@ async def run_pyrofork_bot():
             GLOBAL_STATE.set_status("Idle", "Ready for next batch")
 
         await app.start()
-        GLOBAL_STATE.log("Pyrofork Bot connected and listening.")
+        GLOBAL_STATE.log("Pyrofork Bot connected and operational.")
         await asyncio.Event().wait()
 
     except Exception as e:
@@ -547,7 +625,7 @@ start_bot_thread()
 
 st.set_page_config(page_title="Media Downloader & Unpack Bot", page_icon="⚡", layout="wide")
 st.title("⚡ Media Downloader & Unpack Engine")
-st.caption("Active • aria2c (X) & Native Multi-Thread (YouTube) • Anti-Flood • Memory Streaming")
+st.caption("Active • aria2c (X) & Multi-Fragment (YouTube) • Strict <1.95GB Fallback • Anti-Flood")
 
 col1, col2 = st.columns([1, 2])
 
