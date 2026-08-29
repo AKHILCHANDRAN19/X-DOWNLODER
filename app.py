@@ -11,25 +11,34 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
-# Streamlit UI (Keeps the app active)
+# Streamlit UI
 st.set_page_config(page_title="X Downloader Bot", page_icon="🤖")
 st.title("X Downloader Telegram Bot")
-st.success("Bot is running. Memory streaming and Anti-Flood enabled.")
+st.success("Bot is successfully running in the background. Anti-Flood & Memory streaming active.")
 
-# FIX: Added in_memory=True to prevent Streamlit from wiping the .session file
-app = Client(
-    "x_bot_session",
-    in_memory=True,
-    bot_token=st.secrets["BOT_TOKEN"],
-    api_id=st.secrets["API_ID"],
-    api_hash=st.secrets["API_HASH"]
-)
+# 1. Cache the Client so Streamlit doesn't create a new bot on every UI refresh
+@st.cache_resource
+def get_bot():
+    return Client(
+        "x_bot_session",
+        in_memory=True, # Prevents Streamlit's ephemeral storage from wiping the session
+        bot_token=st.secrets["BOT_TOKEN"],
+        api_id=st.secrets["API_ID"],
+        api_hash=st.secrets["API_HASH"]
+    )
 
-# Global dictionaries to handle asynchronous quality selection
-user_events = {}
-user_choices = {}
+app = get_bot()
 
-# Anti-Flood Progress Bar (Updates every 5 seconds)
+# 2. Cache global dictionaries so they survive Streamlit background reruns
+@st.cache_resource
+def get_state():
+    return {"user_events": {}, "user_choices": {}}
+
+state = get_state()
+user_events = state["user_events"]
+user_choices = state["user_choices"]
+
+# 3. Anti-Flood Progress Callback (Updates every 5 seconds)
 async def progress_callback(current, total, status_msg, action_text, time_tracker):
     now = time.time()
     if now - time_tracker[0] > 5:
@@ -39,7 +48,7 @@ async def progress_callback(current, total, status_msg, action_text, time_tracke
         try:
             await status_msg.edit_text(f"⏳ **{action_text}**\nProgress: {percent}%\nSize: {current_mb}MB / {total_mb}MB")
         except FloodWait as e:
-            await asyncio.sleep(e.value) # Respect Telegram rate limits
+            await asyncio.sleep(e.value) # Respects Telegram's strict flood limits
         except Exception:
             pass
         time_tracker[0] = now
@@ -49,22 +58,23 @@ async def start_cmd(client, message):
     welcome_text = (
         "👋 **Welcome to the X (Twitter) Downloader Bot!**\n\n"
         "**Features:**\n"
-        "• Selectable Quality (Max 720p)\n"
+        "• Selectable Quality (Max 720p fallback)\n"
         "• Supports Videos, Images, and Text posts\n"
         "• Anti-Flood & Memory Optimized\n\n"
         "Just send me X/Twitter URLs (comma separated)."
     )
     await message.reply_text(welcome_text)
 
+# Handles the inline keyboard button presses
 @app.on_callback_query()
 async def handle_quality_selection(client, callback_query):
     user_id = callback_query.from_user.id
     if user_id in user_events:
         user_choices[user_id] = callback_query.data
-        user_events[user_id].set() # Trigger the background thread to continue
+        user_events[user_id].set() # Triggers the waiting process_urls thread to continue
         await callback_query.answer(f"Selected {callback_query.data}p")
     else:
-        await callback_query.answer("Session expired or invalid.", show_alert=True)
+        await callback_query.answer("Session expired or already processing.", show_alert=True)
 
 @app.on_message(filters.text & ~filters.command("start"))
 async def process_urls(client, message):
@@ -74,7 +84,6 @@ async def process_urls(client, message):
         
     user_id = message.from_user.id
     
-    # 1. Ask for quality preference
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("720p", callback_data="720"),
@@ -84,19 +93,18 @@ async def process_urls(client, message):
     ])
     
     status_msg = await message.reply_text(
-        "⚙️ **Select video quality:**\n*(Defaults to 720p automatically in 5 seconds)*", 
+        "⚙️ **Select video quality:**\n*(Automatically defaults to 720p in 5 seconds)*", 
         reply_markup=keyboard
     )
 
-    # 2. Setup 5-second wait trigger
     user_events[user_id] = asyncio.Event()
-    user_choices[user_id] = "720" # Default fallback
+    user_choices[user_id] = "720" # The default fallback
 
     try:
-        # Wait up to 5 seconds for the user to press a button
+        # Pauses script for up to 5 seconds waiting for the user's click
         await asyncio.wait_for(user_events[user_id].wait(), timeout=5.0)
     except asyncio.TimeoutError:
-        pass # 5 seconds passed without interaction, default remains 720p
+        pass 
 
     selected_quality = user_choices.pop(user_id, "720")
     user_events.pop(user_id, None)
@@ -106,7 +114,7 @@ async def process_urls(client, message):
     except Exception:
         pass
 
-    # 3. Dynamic yt-dlp format based on choice (Strictly capping at selection, <1.95GB)
+    # Dynamic yt-dlp format strict cap based on selection
     format_string = f'bestvideo[height<={selected_quality}][filesize<1950M]+bestaudio/best[height<={selected_quality}][filesize<1950M]/best'
     
     ydl_opts = {
@@ -126,7 +134,6 @@ async def process_urls(client, message):
         'no_warnings': True
     }
 
-    # 4. Process each URL sequentially
     for index, url in enumerate(urls):
         try:
             await status_msg.edit_text(f"🔍 Analyzing Link {index + 1}/{len(urls)}...")
@@ -169,7 +176,6 @@ async def process_urls(client, message):
             else:
                 await message.reply_text(f"⚠️ No media found for {url}. It might be a text-only post.")
 
-            # Clean up residual thumbnails
             for f in image_files:
                 if os.path.exists(f):
                     os.remove(f)
@@ -178,22 +184,33 @@ async def process_urls(client, message):
             await message.reply_text(f"❌ Error processing {url}: {e}")
             
         finally:
-            gc.collect() # Aggressively free RAM to stay under Streamlit limits
+            gc.collect() 
             
             if index < len(urls) - 1:
                 await status_msg.edit_text("⏳ Pausing briefly to prevent rate limits...")
                 await asyncio.sleep(random.randint(5, 8))
 
-    await status_msg.edit_text("✅ All tasks completed.")
+    try:
+        await status_msg.edit_text("✅ All tasks completed.")
+    except Exception:
+        pass
 
-# Threading Bypass
+# 4. The PROPER Threading Bypass (Now correctly awaiting app.start)
+async def boot_bot():
+    await app.start()
+    await asyncio.Event().wait()
+
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app.start()
-    loop.run_until_complete(asyncio.Event().wait())
+    loop.run_until_complete(boot_bot())
 
-if "bot_started" not in st.session_state:
-    st.session_state.bot_started = True
+@st.cache_resource
+def start_bot_thread():
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    return True
+
+# Boot the thread once per server deployment
+start_bot_thread()
+
