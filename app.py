@@ -100,12 +100,12 @@ def build_progress_card(action_name: str, current: int, total: int, speed: float
         f"ETA: {eta_str}"
     )
 
-# Native yt-dlp real-time progress hook (Both X & YouTube)
+# Native yt-dlp progress hook for real-time download cards
 def make_ydl_progress_hook(status_msg, loop, tracker):
     def hook(d):
         if d.get('status') == 'downloading':
             now = time.time()
-            if now - tracker['last_update'] > 3.0:
+            if now - tracker['last_update'] > 2.5:
                 downloaded = d.get('downloaded_bytes', 0)
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 speed = d.get('speed', 0) or 0
@@ -125,7 +125,7 @@ def make_ydl_progress_hook(status_msg, loop, tracker):
 # Upload progress callback for Pyrofork
 async def upload_progress_callback(current, total, status_msg, tracker):
     now = time.time()
-    if now - tracker['last_update'] > 3.0:
+    if now - tracker['last_update'] > 2.5:
         elapsed = now - tracker['start_time']
         speed = current / elapsed if elapsed > 0 else 0
         eta = (total - current) / speed if speed > 0 else 0
@@ -135,12 +135,12 @@ async def upload_progress_callback(current, total, status_msg, tracker):
         try:
             await status_msg.edit_text(text)
         except FloodWait as e:
-            await asyncio.sleep(e.value)[span_0](start_span)[span_0](end_span)
+            await asyncio.sleep(e.value)
         except (MessageNotModified, Exception):
             pass
 
 # ==========================================
-# 3. METADATA, THUMBNAILS & BROADCASTING
+# 3. METADATA & THUMBNAIL HELPERS
 # ==========================================
 def extract_video_thumbnail(video_path: str) -> str:
     thumb_path = f"{video_path}.thumb.jpg"
@@ -195,7 +195,7 @@ def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 
     if current_size <= max_bytes:
         return video_path
 
-    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Applying disk compression...")
+    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Applying compression...")
     duration, _, _ = get_video_specs(video_path)
     compressed_path = f"{video_path}.compressed.mp4"
 
@@ -246,11 +246,10 @@ async def run_pyrofork_bot():
                 "👋 **Welcome to the High-Speed Media Downloader & Unpack Bot!** ⚡\n\n"
                 "**🌟 Features:**\n"
                 "• 🚀 **16-Parallel Fragment Engine:** 15–25 MB/s multi-socket download speed\n"
-                "• 🎬 **Multi-Platform Support:** X (Twitter) & YouTube (Public & Unlisted)\n"
-                "• 🎛️ **Full 720p Resolution:** True 720p bitrate (~850 MB) with auto-fallback under 1.95 GB\n"
-                "• 📊 **Live Telemetry Cards:** Real-time speed, percentage, ETA, and progress bar\n"
+                "• 🎬 **True Master 720p Quality:** Full-bitrate stream extraction (~850 MB)\n"
+                "• 📊 **Live Progress Cards:** Real-time speed, percentage, ETA, and progress bar\n"
                 "• 🖼️ **Native Video Thumbnails:** Automatic frame capture & specs embedding\n"
-                "• 📢 **Instant Channel Sync:** Instant 0-second copy to channel\n"
+                "• 📢 **Instant Channel Sync:** 0-second copy to channel\n"
                 "• 🗜️ **Archive Unpacker (`/unzip`):** Uncompresses `.zip`, `.tar`, `.gz`, etc.\n\n"
                 "**How to use:**\n"
                 "• Send one or more X/YouTube links separated by commas.\n"
@@ -331,7 +330,7 @@ async def run_pyrofork_bot():
 
                     await status_msg.edit_text(f"⬆️ Uploading ({idx + 1}/{len(all_extracted)}): `{file_name}`")
 
-                    # 1. Send to user inbox
+                    # Send to User
                     sent_doc = await client.send_document(
                         chat_id=message.chat.id,
                         document=file_path,
@@ -340,7 +339,7 @@ async def run_pyrofork_bot():
                         progress_args=(status_msg, up_tracker)
                     )
 
-                    # 2. Instant Zero-Bandwidth Channel Copy[span_1](start_span)[span_1](end_span)
+                    # Instant Zero-Bandwidth Channel Copy
                     try:
                         await client.copy_message(
                             chat_id=TARGET_CHANNEL_ID,
@@ -387,7 +386,7 @@ async def run_pyrofork_bot():
             ])
 
             status_msg = await message.reply_text(
-                "⚙️ **Select maximum video quality:**\n*(Auto-defaults to 720p in 5 seconds)*",
+                "⚙️ **Select maximum video quality:**\n*(Auto-defaults to 720p in 7 seconds)*",
                 reply_markup=keyboard
             )
 
@@ -395,7 +394,7 @@ async def run_pyrofork_bot():
             USER_CHOICES[user_id] = "720"
 
             try:
-                await asyncio.wait_for(USER_EVENTS[user_id].wait(), timeout=5.0)
+                await asyncio.wait_for(USER_EVENTS[user_id].wait(), timeout=7.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -416,13 +415,13 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)}")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)}...")
 
-                    # 1. Fetch post metadata
+                    # 1. Extract metadata
                     with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
                     post_text = info.get('description') or info.get('title') or ""
 
-                    # 2. Send post text first to user and channel
+                    # 2. Send Post Text First to User and Channel
                     if post_text and post_text.strip():
                         post_formatted = f"📝 **Post Content:**\n\n{post_text.strip()}"
                         sent_text = await message.reply_text(post_formatted)
@@ -436,11 +435,10 @@ async def run_pyrofork_bot():
                             GLOBAL_STATE.log(f"Channel Text Copy Notice: {e}")
                         await asyncio.sleep(0.4)
 
-                    # 3. Format selection locked to true full-bitrate 720p with 16 parallel fragments
+                    # 3. Master 720p Format String (Full 854 MB Quality, 16 Sockets)
                     fmt = (
                         f"bestvideo[height<={selected_quality}][ext=mp4]+bestaudio[ext=m4a]/"
                         f"bestvideo[height<={selected_quality}]+bestaudio/"
-                        f"best[height<={selected_quality}][ext=mp4]/"
                         f"best[height<={selected_quality}]/"
                         f"bestvideo[height<=480]+bestaudio/best[height<=480]/"
                         f"best[height<=720]"
@@ -451,16 +449,17 @@ async def run_pyrofork_bot():
                         'format': fmt,
                         'outtmpl': f'{video_id}.%(ext)s',
                         'writethumbnail': True,
-                        'concurrent_fragment_downloads': 16, # 16 parallel sockets (15–25 MB/s)
+                        'concurrent_fragment_downloads': 16,  # 16 Parallel Connections
                         'progress_hooks': [make_ydl_progress_hook(status_msg, running_loop, dl_tracker)],
                         'quiet': True,
                         'no_warnings': True
                     }
 
+                    # Execute download
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         await asyncio.to_thread(ydl.download, [url])
 
-                    # 4. Identify downloaded media files
+                    # 4. Identify downloaded files
                     downloaded = glob.glob(f"{video_id}.*")
                     media_files = [f for f in downloaded if not f.endswith(('.jpg', '.jpeg', '.webp', '.png', '.thumb.jpg'))]
                     image_files = [f for f in downloaded if f.endswith(('.jpg', '.jpeg', '.webp', '.png')) and not f.endswith('.thumb.jpg')]
@@ -478,7 +477,7 @@ async def run_pyrofork_bot():
                         up_tracker = {'start_time': time.time(), 'last_update': 0.0}
                         await status_msg.edit_text(f"⬆️ Uploading Video ({selected_quality}p)...")
 
-                        # Send to User Inbox
+                        # Send to User
                         sent_video = await client.send_video(
                             chat_id=message.chat.id,
                             video=video_file,
@@ -492,7 +491,7 @@ async def run_pyrofork_bot():
                             progress_args=(status_msg, up_tracker)
                         )
 
-                        # Instant Zero-Bandwidth Channel Copy[span_2](start_span)[span_2](end_span)
+                        # Instant Zero-Bandwidth Channel Copy
                         try:
                             await client.copy_message(
                                 chat_id=TARGET_CHANNEL_ID,
@@ -590,4 +589,3 @@ with col2:
         "\n".join(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else "System ready. Listening for updates...",
         language="text"
     )
-
