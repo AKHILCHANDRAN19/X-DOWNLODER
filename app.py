@@ -10,6 +10,7 @@ import zipfile
 import tarfile
 import subprocess
 import collections
+import urllib.request
 from datetime import datetime
 import yt_dlp
 from pyrogram import Client, filters
@@ -140,7 +141,6 @@ async def monitor_aria2_download(video_id: str, total_bytes: int, status_msg, st
             speed = (current_bytes - last_bytes) / (now - last_update) if last_update > 0 else (current_bytes / elapsed)
             last_bytes = current_bytes
 
-            # Dynamically adapt total if stream size exceeds initial metadata estimate
             effective_total = max(total_bytes, current_bytes) if total_bytes > 0 else 0
             eta = (effective_total - current_bytes) / speed if (speed > 0 and effective_total > current_bytes) else 0
 
@@ -226,7 +226,7 @@ def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 
     if current_size <= max_bytes:
         return video_path
 
-    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Compressing...")
+    GLOBAL_STATE.log(f"Video ({format_size(current_size)}) exceeds 1.95 GB. Applying disk compression...")
     duration, _, _ = get_video_specs(video_path)
     compressed_path = f"{video_path}.compressed.mp4"
 
@@ -257,34 +257,49 @@ def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 
 
     return video_path
 
-def get_accurate_720p_size(info: dict, selected_quality: str) -> int:
+def get_exact_stream_size(info: dict, is_youtube: bool, selected_quality: str) -> int:
     target_h = int(selected_quality) if str(selected_quality).isdigit() else 720
     formats = info.get('formats', [])
 
-    # Filter matching formats at or below the selected quality
-    matching_formats = [
-        f for f in formats
-        if (f.get('height') or 0) <= target_h and f.get('vcodec') != 'none'
-    ]
+    if not is_youtube:
+        # Prioritize direct progressive HTTP MP4 streams
+        http_formats = [
+            f for f in formats
+            if f.get('protocol') in ['http', 'https']
+            and f.get('vcodec') != 'none'
+            and (f.get('height') or 0) <= target_h
+            and '.m3u8' not in (f.get('url') or '')
+        ]
+        http_formats.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
 
-    # Sort descending by resolution, then by size/bitrate
-    matching_formats.sort(
-        key=lambda x: (
-            x.get('height') or 0,
-            x.get('filesize') or x.get('filesize_approx') or ((x.get('tbr') or 0) * (info.get('duration') or 0))
-        ),
-        reverse=True
-    )
+        for f in http_formats:
+            size = f.get('filesize') or f.get('filesize_approx')
+            if size and size > 0:
+                return size
 
-    if matching_formats:
-        best_match = matching_formats[0]
+            url = f.get('url')
+            if url:
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}, method='HEAD')
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        cl = resp.headers.get('Content-Length')
+                        if cl and cl.isdigit():
+                            return int(cl)
+                except Exception:
+                    pass
+
+    # YouTube / Generic Stream fallback
+    matching = [f for f in formats if (f.get('height') or 0) <= target_h and f.get('vcodec') != 'none']
+    matching.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+
+    if matching:
+        best_match = matching[0]
         size = best_match.get('filesize') or best_match.get('filesize_approx')
         if size and size > 0:
             return size
         if best_match.get('tbr') and info.get('duration'):
             return int((best_match['tbr'] * 1024 / 8) * info['duration'])
 
-    # Fallback to general estimation
     total = info.get('filesize') or info.get('filesize_approx') or 0
     if not total and info.get('tbr') and info.get('duration'):
         total = int((info['tbr'] * 1024 / 8) * info['duration'])
@@ -334,15 +349,14 @@ async def run_pyrofork_bot():
         @app.on_message(filters.command("start") & filters.private)
         async def handle_start(client, message):
             welcome_text = (
-                "👋 **Welcome to the Media Downloader & Unpack Bot!** ⚡\n\n"
-                "**🌟 Features:**\n"
-                "• 🚀 **Engine Routing:**\n"
-                "   - **X (Twitter):** `aria2c` 16-connection parallel acceleration\n"
-                "   - **YouTube:** Multi-fragment stream extraction (Public & Unlisted)\n"
-                "• 🎛️ **Resolution & Quality:** True 720p with automatic fallback under 1.95 GB\n"
-                "• 📊 **Live Telemetry Cards:** Real-time speed, percentage, ETA, and progress bar\n"
-                "• 🖼️ **Auto Thumbnail Generation:** High-resolution frame capture & video specs\n"
-                "• 📢 **Channel Broadcast:** Synchronized media and post archiving\n"
+                "👋 **Welcome to the Media Downloader & Extraction Bot!** ⚡\n\n"
+                "**🌟 Capabilities:**\n"
+                "• 🚀 **Direct MP4 Acceleration:** `aria2c` 16-connection parallel speed\n"
+                "• 🎬 **Multi-Platform Support:** X (Twitter) & YouTube (Public & Unlisted)\n"
+                "• 🎛️ **Resolution Control:** True 720p with auto 480p/360p fallback under 1.95 GB\n"
+                "• 📊 **Live Progress Cards:** Real-time speed, percentage, ETA, and progress bar\n"
+                "• 🖼️ **Native Video Thumbnails:** Automatic frame capture & specs embedding\n"
+                "• 📢 **Channel Broadcasting:** Automatic archive synchronization\n"
                 "• 🗜️ **Archive Unpacker (`/unzip`):** Uncompresses `.zip`, `.tar`, `.gz`, etc.\n\n"
                 "**How to use:**\n"
                 "• Send one or more X/YouTube links separated by commas.\n"
@@ -423,7 +437,6 @@ async def run_pyrofork_bot():
 
                     await status_msg.edit_text(f"⬆️ Uploading ({idx + 1}/{len(all_extracted)}): `{file_name}`")
 
-                    # 1. Send to user inbox
                     await client.send_document(
                         chat_id=message.chat.id,
                         document=file_path,
@@ -432,7 +445,6 @@ async def run_pyrofork_bot():
                         progress_args=(status_msg, up_tracker)
                     )
 
-                    # 2. Broadcast to channel
                     await broadcast_to_channel(client, doc_path=file_path, caption=doc_caption)
 
                     if os.path.exists(file_path):
@@ -503,23 +515,23 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)} ({engine_name})")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)} via {engine_name}...")
 
-                    # 1. Fetch metadata
+                    # 1. Extract metadata
                     with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
                     post_text = info.get('description') or info.get('title') or ""
 
-                    # 2. SEND POST TEXT FIRST (To User and Channel)
+                    # 2. Send post text first to User and Channel
                     if post_text and post_text.strip():
                         post_formatted = f"📝 **Post Content:**\n\n{post_text.strip()}"
                         await message.reply_text(post_formatted)
                         await broadcast_to_channel(client, text=post_formatted)
                         await asyncio.sleep(0.4)
 
-                    # 3. Calculate accurate size for progress telemetry
-                    total_bytes = get_accurate_720p_size(info, selected_quality)
+                    # 3. Calculate exact stream size
+                    total_bytes = get_exact_stream_size(info, is_youtube, selected_quality)
 
-                    # 4. Format selection locked strictly to true 720p quality
+                    # 4. Engine-specific format strings
                     if is_youtube:
                         fmt = (
                             f"bestvideo[height<={selected_quality}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -540,12 +552,13 @@ async def run_pyrofork_bot():
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             await asyncio.to_thread(ydl.download, [url])
                     else:
-                        # Ensures full quality 720p stream with aria2 multi-threading
+                        # Prioritize direct progressive MP4 to unlock 16-connection aria2 speed (~850 MB for full 720p)
                         fmt = (
+                            f"best[height<={selected_quality}][protocol^=http][ext=mp4]/"
+                            f"best[height<={selected_quality}][protocol^=http]/"
                             f"bestvideo[height<={selected_quality}]+bestaudio/"
                             f"best[height<={selected_quality}][ext=mp4]/"
                             f"best[height<={selected_quality}]/"
-                            f"bestvideo[height<=480]+bestaudio/best[height<=480]/"
                             f"best[height<=720]"
                         )
                         ydl_opts = {
