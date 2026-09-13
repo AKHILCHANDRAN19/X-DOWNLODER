@@ -544,6 +544,163 @@ async def run_pyrofork_bot():
                 pass
             GLOBAL_STATE.set_status("Idle", "Ready for next batch")
 
+        # ----------------------------------------------------
+        # MULTI-FILE BATCH COLLECTOR & HIGH-SPEED ZIP
+        # ----------------------------------------------------
+        BATCH_DATA = {}
+
+        @app.on_message(filters.private & (filters.document | filters.photo | filters.video | filters.audio))
+        async def handle_batch_incoming(client, message):
+            user_id = message.from_user.id
+            if user_id not in BATCH_DATA:
+                batch_dir = os.path.abspath(f"batch_{user_id}_{int(time.time())}")
+                os.makedirs(batch_dir, exist_ok=True)
+                BATCH_DATA[user_id] = {
+                    "dir": batch_dir,
+                    "count": 0,
+                    "status_msg_id": None,
+                    "lock": asyncio.Lock()
+                }
+
+            b_info = BATCH_DATA[user_id]
+            dl_path = os.path.join(b_info["dir"], "")
+            saved = await message.download(file_name=dl_path)
+
+            async with b_info["lock"]:
+                if saved:
+                    b_info["count"] += 1
+                count = b_info["count"]
+
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"✅ Done ({count} Files Received)", callback_data=f"batch_done_{user_id}")],
+                    [InlineKeyboardButton("❌ Clear / Cancel", callback_data=f"batch_clear_{user_id}")]
+                ])
+
+                text = (
+                    f"📥 **Received {count} file(s)!**\n"
+                    "Keep sending your PDFs, images, or files.\n"
+                    "When finished, click the **Done** button below."
+                )
+
+                if b_info.get("status_msg_id"):
+                    try:
+                        await client.edit_message_text(
+                            chat_id=user_id,
+                            message_id=b_info["status_msg_id"],
+                            text=text,
+                            reply_markup=markup
+                        )
+                        return
+                    except Exception:
+                        pass
+
+                try:
+                    sent = await message.reply_text(text, reply_markup=markup)
+                    b_info["status_msg_id"] = sent.id
+                except Exception:
+                    pass
+
+        @app.on_callback_query(filters.regex(r"^batch_done_(\d+)$"))
+        async def handle_batch_done(client, callback_query):
+            user_id = int(callback_query.matches[0].group(1))
+            if callback_query.from_user.id != user_id:
+                return await callback_query.answer("⚠️ Not your session!", show_alert=True)
+
+            b_info = BATCH_DATA.get(user_id)
+            if not b_info or b_info.get("count", 0) == 0:
+                return await callback_query.answer("❌ No files collected yet!", show_alert=True)
+
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📦 Zip Sent Files", callback_data=f"batch_zip_{user_id}")],
+                [InlineKeyboardButton("❌ Cancel / Clear", callback_data=f"batch_clear_{user_id}")]
+            ])
+
+            await callback_query.message.edit_text(
+                f"🎯 **All files received!** Total items: **{b_info['count']}**\n\n"
+                "Click **Zip Sent Files** to compress and receive your archive immediately.",
+                reply_markup=markup
+            )
+            await callback_query.answer()
+
+        @app.on_callback_query(filters.regex(r"^batch_zip_(\d+)$"))
+        async def handle_batch_zip(client, callback_query):
+            user_id = int(callback_query.matches[0].group(1))
+            if callback_query.from_user.id != user_id:
+                return await callback_query.answer("⚠️ Not your session!", show_alert=True)
+
+            b_info = BATCH_DATA.pop(user_id, None)
+            if not b_info or not os.path.exists(b_info.get("dir", "")):
+                return await callback_query.answer("❌ Session expired or files not found!", show_alert=True)
+
+            work_dir = b_info["dir"]
+            total_files = b_info["count"]
+            zip_filename = "BOOK.zip"
+            zip_filepath = os.path.join(work_dir, zip_filename)
+
+            status_msg = callback_query.message
+            await status_msg.edit_text("⚡ **Compressing files at high speed...**")
+
+            def create_zip():
+                with zipfile.ZipFile(zip_filepath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                    for root, _, files in os.walk(work_dir):
+                        for file in files:
+                            if file == zip_filename:
+                                continue
+                            full_path = os.path.join(root, file)
+                            rel_name = os.path.relpath(full_path, work_dir)
+                            zf.write(full_path, arcname=rel_name)
+
+            await asyncio.to_thread(create_zip)
+
+            if not os.path.exists(zip_filepath) or os.path.getsize(zip_filepath) == 0:
+                await status_msg.edit_text("❌ Failed to create zip archive.")
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return
+
+            zip_size = os.path.getsize(zip_filepath)
+            await status_msg.edit_text(f"📤 **Uploading BOOK.zip ({format_size(zip_size)})...**")
+
+            up_tracker = {'start_time': time.time(), 'last_update': 0.0}
+            try:
+                sent_doc = await client.send_document(
+                    chat_id=user_id,
+                    document=zip_filepath,
+                    file_name="BOOK.zip",
+                    caption=f"📦 **Batch ZIP Complete!**\n📄 Files: `{total_files}`\n💾 Size: `{format_size(zip_size)}`",
+                    progress=upload_progress_callback,
+                    progress_args=(status_msg, up_tracker)
+                )
+
+                try:
+                    await client.copy_message(
+                        chat_id=TARGET_CHANNEL_ID,
+                        from_chat_id=user_id,
+                        message_id=sent_doc.id
+                    )
+                except Exception as e:
+                    GLOBAL_STATE.log(f"Channel Batch Copy Notice: {e}")
+
+                await status_msg.delete()
+            except Exception as e:
+                GLOBAL_STATE.log(f"Zip upload error: {e}")
+                await status_msg.edit_text(f"❌ Error uploading ZIP: {e}")
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                gc.collect()
+
+        @app.on_callback_query(filters.regex(r"^batch_clear_(\d+)$"))
+        async def handle_batch_clear(client, callback_query):
+            user_id = int(callback_query.matches[0].group(1))
+            if callback_query.from_user.id != user_id:
+                return await callback_query.answer("⚠️ Not your session!", show_alert=True)
+
+            b_info = BATCH_DATA.pop(user_id, None)
+            if b_info and os.path.exists(b_info.get("dir", "")):
+                shutil.rmtree(b_info["dir"], ignore_errors=True)
+
+            await callback_query.message.edit_text("🗑️ **Batch cleared and discarded.**")
+            await callback_query.answer("Session cleared")
+
         await app.start()
         GLOBAL_STATE.log("Pyrofork Bot connected and operational.")
         await asyncio.Event().wait()
@@ -589,3 +746,4 @@ with col2:
         "\n".join(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else "System ready. Listening for updates...",
         language="text"
     )
+
