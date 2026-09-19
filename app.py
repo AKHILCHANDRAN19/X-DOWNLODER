@@ -59,7 +59,6 @@ GLOBAL_STATE = get_telemetry()
 USER_EVENTS = {}
 USER_CHOICES = {}
 
-# Custom yt-dlp logger adapter to funnel all verbose logs into Python logging
 class YtDlpLogger:
     def __init__(self):
         self.last_error = ""
@@ -83,13 +82,11 @@ class YtDlpLogger:
             logger.error(f"[yt-dlp] {clean_msg}")
             GLOBAL_STATE.log(f"yt-dlp ERROR: {clean_msg}")
 
-# Auto-detect and parse JSON array or raw Netscape string into cookies.txt
 def setup_cookie_file() -> str:
     cookie_path = os.path.abspath("cookies.txt")
     if "YOUTUBE_COOKIES" in st.secrets and st.secrets["YOUTUBE_COOKIES"].strip():
         raw_data = st.secrets["YOUTUBE_COOKIES"].strip()
         
-        # 1. Check if user provided JSON array format
         try:
             parsed_json = json.loads(raw_data)
             if isinstance(parsed_json, list):
@@ -115,7 +112,6 @@ def setup_cookie_file() -> str:
         except Exception:
             pass
 
-        # 2. Otherwise write raw Netscape text
         try:
             with open(cookie_path, "w", encoding="utf-8") as f:
                 f.write(raw_data)
@@ -443,7 +439,7 @@ async def run_pyrofork_bot():
                 gc.collect()
 
         # ----------------------------------------------------
-        # MEDIA URL DOWNLOADER (X + YOUTUBE WITH CURL_CFFI & COOKIES)
+        # MEDIA URL DOWNLOADER (X + YOUTUBE WITH RESILIENT CLIENT FALLBACK)
         # ----------------------------------------------------
         @app.on_message(filters.text & filters.private & ~filters.command(["start", "unzip"]))
         async def handle_media_urls(client, message):
@@ -494,20 +490,21 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)}")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)}...")
 
-                    # Use ImpersonateTarget instance (fixes the AssertionError)
                     try:
                         impersonate_obj = ImpersonateTarget.from_str("chrome")
                     except Exception as imp_err:
                         logger.warning(f"Could not initialize ImpersonateTarget: {imp_err}")
                         impersonate_obj = None
 
+                    # Use tv, web_embedded, mweb, web_creator (all support cookies, bypass SABR)
                     common_ydl_opts = {
                         'logger': ydl_logger,
                         'verbose': True,
                         'live_from_start': True,
                         'extractor_args': {
                             'youtube': {
-                                'player_client': ['web', 'android'],
+                                'player_client': ['tv', 'web_embedded', 'mweb', 'web_creator', 'web'],
+                                'formats': ['missing_pot'],
                             }
                         }
                     }
@@ -541,13 +538,13 @@ async def run_pyrofork_bot():
                             GLOBAL_STATE.log(f"Channel Text Copy Notice: {e}")
                         await asyncio.sleep(0.4)
 
-                    # 3. Format selection
+                    # 3. Format selection with universal /best fallback
                     fmt = (
                         f"bestvideo[height<={selected_quality}][ext=mp4]+bestaudio[ext=m4a]/"
                         f"bestvideo[height<={selected_quality}]+bestaudio/"
                         f"best[height<={selected_quality}]/"
                         f"bestvideo[height<=480]+bestaudio/best[height<=480]/"
-                        f"best[height<=720]"
+                        f"best[height<={selected_quality}]/best"
                     )
 
                     dl_tracker = {'last_update': 0.0}
@@ -635,12 +632,11 @@ async def run_pyrofork_bot():
                     raw_err = str(e).strip() or ydl_logger.last_error or repr(e)
                     GLOBAL_STATE.log(f"Error processing {url}: {raw_err}")
                     logger.exception(f"Traceback for {url}:")
-                    clean_err = str(raw_err).replace("`", "'")
                     err_response = (
-                        f"❌ **Error downloading link:**\n{url}\n\n"
-                        f"**Diagnostic Details:**\n`{clean_err}`"
+                        f"❌ Error downloading link:\n{url}\n\n"
+                        f"Diagnostic Details:\n{raw_err}"
                     )
-                    await message.reply_text(err_response)
+                    await message.reply_text(err_response, parse_mode=None)
 
                 finally:
                     gc.collect()
