@@ -11,6 +11,7 @@ import tarfile
 import subprocess
 import collections
 import logging
+import json
 from datetime import datetime
 import yt_dlp
 from pyrogram import Client, filters
@@ -59,6 +60,9 @@ USER_CHOICES = {}
 
 # Custom yt-dlp logger adapter to funnel all verbose logs into Python logging
 class YtDlpLogger:
+    def __init__(self):
+        self.last_error = ""
+
     def debug(self, msg: str):
         if msg.strip():
             logger.debug(f"[yt-dlp] {msg}")
@@ -72,8 +76,57 @@ class YtDlpLogger:
             logger.warning(f"[yt-dlp] {msg}")
 
     def error(self, msg: str):
-        if msg.strip():
-            logger.error(f"[yt-dlp] {msg}")
+        clean_msg = msg.strip()
+        if clean_msg:
+            self.last_error = clean_msg
+            logger.error(f"[yt-dlp] {clean_msg}")
+            GLOBAL_STATE.log(f"yt-dlp ERROR: {clean_msg}")
+
+# Auto-detect and parse JSON array or raw Netscape string into cookies.txt
+def setup_cookie_file() -> str:
+    cookie_path = os.path.abspath("cookies.txt")
+    if "YOUTUBE_COOKIES" in st.secrets and st.secrets["YOUTUBE_COOKIES"].strip():
+        raw_data = st.secrets["YOUTUBE_COOKIES"].strip()
+        
+        # 1. Check if user provided JSON array format
+        try:
+            parsed_json = json.loads(raw_data)
+            if isinstance(parsed_json, list):
+                lines = [
+                    "# Netscape HTTP Cookie File\n",
+                    "# Converted automatically from JSON array\n"
+                ]
+                for c in parsed_json:
+                    domain = c.get("domain", ".youtube.com")
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = c.get("path", "/")
+                    secure = "TRUE" if c.get("secure", False) else "FALSE"
+                    exp = int(c.get("expirationDate") or 0)
+                    name = c.get("name", "")
+                    val = c.get("value", "")
+                    if name:
+                        lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{exp}\t{name}\t{val}\n")
+                
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                logger.info(f"Loaded {len(parsed_json)} cookies from JSON secrets into {cookie_path}")
+                return cookie_path
+        except Exception:
+            pass
+
+        # 2. Otherwise write raw Netscape text
+        try:
+            with open(cookie_path, "w", encoding="utf-8") as f:
+                f.write(raw_data)
+            logger.info(f"Loaded Netscape cookies directly into {cookie_path}")
+            return cookie_path
+        except Exception as e:
+            logger.error(f"Failed to write cookie file: {e}")
+
+    elif os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+        return cookie_path
+
+    return None
 
 # ==========================================
 # 2. TELEGRAM PROGRESS CARD GENERATORS
@@ -389,7 +442,7 @@ async def run_pyrofork_bot():
                 gc.collect()
 
         # ----------------------------------------------------
-        # MEDIA URL DOWNLOADER (X + YOUTUBE WITH CURL_CFFI)
+        # MEDIA URL DOWNLOADER (X + YOUTUBE WITH CURL_CFFI & COOKIES)
         # ----------------------------------------------------
         @app.on_message(filters.text & filters.private & ~filters.command(["start", "unzip"]))
         async def handle_media_urls(client, message):
@@ -430,26 +483,34 @@ async def run_pyrofork_bot():
                 pass
 
             running_loop = asyncio.get_running_loop()
+            cookie_file = setup_cookie_file()
 
             for idx, url in enumerate(urls):
                 video_id = f"media_{int(time.time())}_{idx}"
+                ydl_logger = YtDlpLogger()
 
                 try:
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)}")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)}...")
 
-                    # Shared configuration using curl_cffi and mobile client endpoints
+                    # Shared configuration using curl_cffi and mobile/web client endpoints
                     common_ydl_opts = {
                         'impersonate': 'chrome',
-                        'logger': YtDlpLogger(),
+                        'logger': ydl_logger,
                         'verbose': True,
+                        'live_from_start': True,
                         'extractor_args': {
                             'youtube': {
-                                'player_client': ['android', 'ios'],
-                                'player_skip': ['configs', 'webpage'],
+                                'player_client': ['android', 'web'],
                             }
                         }
                     }
+
+                    if cookie_file:
+                        common_ydl_opts['cookiefile'] = cookie_file
+
+                    if "PROXY" in st.secrets and st.secrets["PROXY"].strip():
+                        common_ydl_opts['proxy'] = st.secrets["PROXY"].strip()
 
                     # 1. Extract metadata
                     with yt_dlp.YoutubeDL(common_ydl_opts) as ydl:
@@ -562,8 +623,14 @@ async def run_pyrofork_bot():
                             os.remove(f)
 
                 except Exception as e:
-                    GLOBAL_STATE.log(f"Error processing {url}: {e}")
-                    await message.reply_text(f"❌ Error downloading `{url}`: {e}")
+                    raw_err = str(e).strip() or ydl_logger.last_error or repr(e)
+                    GLOBAL_STATE.log(f"Error processing {url}: {raw_err}")
+                    logger.exception(f"Traceback for {url}:")
+                    err_response = (
+                        f"❌ **Error downloading link:**\n`{url}`\n\n"
+                        f"**Diagnostic Details:**\n```{raw_err}```"
+                    )
+                    await message.reply_text(err_response)
 
                 finally:
                     gc.collect()
@@ -779,3 +846,4 @@ with col2:
         "\n".join(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else "System ready. Listening for updates...",
         language="text"
     )
+
