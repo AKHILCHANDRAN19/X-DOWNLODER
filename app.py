@@ -10,6 +10,7 @@ import zipfile
 import tarfile
 import subprocess
 import collections
+import logging
 from datetime import datetime
 import yt_dlp
 from pyrogram import Client, filters
@@ -17,8 +18,15 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
 
 # ==========================================
-# 0. CONFIGURATION & CHANNEL SETUP
+# 0. LOGGING & CONFIGURATION
 # ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("MediaBot")
+
 TARGET_CHANNEL_ID = -1004495069376
 
 # ==========================================
@@ -33,11 +41,12 @@ class TelemetryState:
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {text}"
         self.log_history.append(entry)
-        print(entry, flush=True)
+        logger.info(text)
 
     def set_status(self, task: str, details: str):
         self.current_status["task"] = task
         self.current_status["details"] = details
+        logger.info(f"Status update -> Task: {task} | Details: {details}")
 
 @st.cache_resource
 def get_telemetry():
@@ -47,6 +56,24 @@ GLOBAL_STATE = get_telemetry()
 
 USER_EVENTS = {}
 USER_CHOICES = {}
+
+# Custom yt-dlp logger adapter to funnel all verbose logs into Python logging
+class YtDlpLogger:
+    def debug(self, msg: str):
+        if msg.strip():
+            logger.debug(f"[yt-dlp] {msg}")
+
+    def info(self, msg: str):
+        if msg.strip():
+            logger.info(f"[yt-dlp] {msg}")
+
+    def warning(self, msg: str):
+        if msg.strip():
+            logger.warning(f"[yt-dlp] {msg}")
+
+    def error(self, msg: str):
+        if msg.strip():
+            logger.error(f"[yt-dlp] {msg}")
 
 # ==========================================
 # 2. TELEGRAM PROGRESS CARD GENERATORS
@@ -100,7 +127,6 @@ def build_progress_card(action_name: str, current: int, total: int, speed: float
         f"ETA: {eta_str}"
     )
 
-# Native yt-dlp progress hook for real-time download cards
 def make_ydl_progress_hook(status_msg, loop, tracker):
     def hook(d):
         if d.get('status') == 'downloading':
@@ -122,7 +148,6 @@ def make_ydl_progress_hook(status_msg, loop, tracker):
                     pass
     return hook
 
-# Upload progress callback for Pyrofork
 async def upload_progress_callback(current, total, status_msg, tracker):
     now = time.time()
     if now - tracker['last_update'] > 2.5:
@@ -157,8 +182,8 @@ def extract_video_thumbnail(video_path: str) -> str:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             return thumb_path
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Thumbnail extraction fallback error: {e}")
     return None
 
 def get_video_specs(video_path: str):
@@ -183,8 +208,8 @@ def get_video_specs(video_path: str):
                         height = int(l)
             except Exception:
                 pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Specs extraction warning: {e}")
     return duration, width, height
 
 def ensure_under_telegram_limit(video_path: str, max_bytes: int = 1950 * 1024 * 1024) -> str:
@@ -330,7 +355,6 @@ async def run_pyrofork_bot():
 
                     await status_msg.edit_text(f"⬆️ Uploading ({idx + 1}/{len(all_extracted)}): `{file_name}`")
 
-                    # Send to User
                     sent_doc = await client.send_document(
                         chat_id=message.chat.id,
                         document=file_path,
@@ -339,7 +363,6 @@ async def run_pyrofork_bot():
                         progress_args=(status_msg, up_tracker)
                     )
 
-                    # Instant Zero-Bandwidth Channel Copy
                     try:
                         await client.copy_message(
                             chat_id=TARGET_CHANNEL_ID,
@@ -366,7 +389,7 @@ async def run_pyrofork_bot():
                 gc.collect()
 
         # ----------------------------------------------------
-        # MEDIA URL DOWNLOADER (X + YOUTUBE)
+        # MEDIA URL DOWNLOADER (X + YOUTUBE WITH CURL_CFFI)
         # ----------------------------------------------------
         @app.on_message(filters.text & filters.private & ~filters.command(["start", "unzip"]))
         async def handle_media_urls(client, message):
@@ -415,8 +438,21 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)}")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)}...")
 
+                    # Shared configuration using curl_cffi and mobile client endpoints
+                    common_ydl_opts = {
+                        'impersonate': 'chrome',
+                        'logger': YtDlpLogger(),
+                        'verbose': True,
+                        'extractor_args': {
+                            'youtube': {
+                                'player_client': ['android', 'ios'],
+                                'player_skip': ['configs', 'webpage'],
+                            }
+                        }
+                    }
+
                     # 1. Extract metadata
-                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    with yt_dlp.YoutubeDL(common_ydl_opts) as ydl:
                         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
                     post_text = info.get('description') or info.get('title') or ""
@@ -435,7 +471,7 @@ async def run_pyrofork_bot():
                             GLOBAL_STATE.log(f"Channel Text Copy Notice: {e}")
                         await asyncio.sleep(0.4)
 
-                    # 3. Master 720p Format String (Full 854 MB Quality, 16 Sockets)
+                    # 3. Format selection
                     fmt = (
                         f"bestvideo[height<={selected_quality}][ext=mp4]+bestaudio[ext=m4a]/"
                         f"bestvideo[height<={selected_quality}]+bestaudio/"
@@ -445,18 +481,17 @@ async def run_pyrofork_bot():
                     )
 
                     dl_tracker = {'last_update': 0.0}
-                    ydl_opts = {
+                    ydl_download_opts = {
+                        **common_ydl_opts,
                         'format': fmt,
                         'outtmpl': f'{video_id}.%(ext)s',
                         'writethumbnail': True,
-                        'concurrent_fragment_downloads': 16,  # 16 Parallel Connections
+                        'concurrent_fragment_downloads': 16,
                         'progress_hooks': [make_ydl_progress_hook(status_msg, running_loop, dl_tracker)],
-                        'quiet': True,
-                        'no_warnings': True
                     }
 
                     # Execute download
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
                         await asyncio.to_thread(ydl.download, [url])
 
                     # 4. Identify downloaded files
@@ -477,7 +512,6 @@ async def run_pyrofork_bot():
                         up_tracker = {'start_time': time.time(), 'last_update': 0.0}
                         await status_msg.edit_text(f"⬆️ Uploading Video ({selected_quality}p)...")
 
-                        # Send to User
                         sent_video = await client.send_video(
                             chat_id=message.chat.id,
                             video=video_file,
@@ -491,7 +525,6 @@ async def run_pyrofork_bot():
                             progress_args=(status_msg, up_tracker)
                         )
 
-                        # Instant Zero-Bandwidth Channel Copy
                         try:
                             await client.copy_message(
                                 chat_id=TARGET_CHANNEL_ID,
@@ -746,4 +779,3 @@ with col2:
         "\n".join(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else "System ready. Listening for updates...",
         language="text"
     )
-
