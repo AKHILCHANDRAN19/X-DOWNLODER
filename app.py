@@ -14,6 +14,7 @@ import logging
 import json
 from datetime import datetime
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
@@ -493,18 +494,26 @@ async def run_pyrofork_bot():
                     GLOBAL_STATE.set_status("Processing", f"Link {idx + 1}/{len(urls)}")
                     await status_msg.edit_text(f"🔍 Analyzing Link {idx + 1}/{len(urls)}...")
 
-                    # Shared configuration using curl_cffi and mobile/web client endpoints
+                    # Use ImpersonateTarget instance (fixes the AssertionError)
+                    try:
+                        impersonate_obj = ImpersonateTarget.from_str("chrome")
+                    except Exception as imp_err:
+                        logger.warning(f"Could not initialize ImpersonateTarget: {imp_err}")
+                        impersonate_obj = None
+
                     common_ydl_opts = {
-                        'impersonate': 'chrome',
                         'logger': ydl_logger,
                         'verbose': True,
                         'live_from_start': True,
                         'extractor_args': {
                             'youtube': {
-                                'player_client': ['android', 'web'],
+                                'player_client': ['web', 'android'],
                             }
                         }
                     }
+
+                    if impersonate_obj is not None:
+                        common_ydl_opts['impersonate'] = impersonate_obj
 
                     if cookie_file:
                         common_ydl_opts['cookiefile'] = cookie_file
@@ -626,9 +635,10 @@ async def run_pyrofork_bot():
                     raw_err = str(e).strip() or ydl_logger.last_error or repr(e)
                     GLOBAL_STATE.log(f"Error processing {url}: {raw_err}")
                     logger.exception(f"Traceback for {url}:")
+                    clean_err = str(raw_err).replace("`", "'")
                     err_response = (
-                        f"❌ **Error downloading link:**\n`{url}`\n\n"
-                        f"**Diagnostic Details:**\n```{raw_err}```"
+                        f"❌ **Error downloading link:**\n{url}\n\n"
+                        f"**Diagnostic Details:**\n`{clean_err}`"
                     )
                     await message.reply_text(err_response)
 
