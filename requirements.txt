@@ -2,3 +2,4 @@ streamlit
 pyrofork
 tgcrypto
 yt-dlp
+curl_cffi
